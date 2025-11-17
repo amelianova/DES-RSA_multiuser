@@ -1,129 +1,88 @@
-# chat_server_fixed.py
+# chat_server.py
 import socket
 import threading
 from typing import Dict
 
-HOST = '192.168.100.163'
+HOST = '0.0.0.0'
 PORT = 55555
 
 clients: Dict[str, dict] = {}
-clients_lock = threading.Lock()
-registration_order = []  # keep order of registration
+order = []
 
-def recv_line(conn):
-    data = b''
+def recv_line(c):
+    d=b''
     while True:
-        chunk = conn.recv(1024)
-        if not chunk:
+        x=c.recv(1024)
+        if not x:
             return None
-        data += chunk
-        if b'\n' in chunk:
+        d+=x
+        if b'\n' in x:
             break
-    return data.decode('utf-8').strip()
+    return d.decode().strip()
 
-def send_line(conn, text):
-    try:
-        conn.sendall((text + '\n').encode('utf-8'))
-    except:
-        pass
+def send(c,t):
+    try: c.sendall((t+'\n').encode())
+    except: pass
 
-def handle_client(conn, addr):
+def handle(conn,addr):
     try:
-        line = recv_line(conn)
+        line=recv_line(conn)
         if not line:
-            conn.close()
-            return
-        parts = line.split('|')
-        if len(parts) != 4 or parts[0] != 'REGISTER':
-            send_line(conn, "ERROR|Invalid registration format. Use REGISTER|<name>|<n>|<e>")
-            conn.close()
-            return
-        _, name, n_str, e_str = parts
-        with clients_lock:
-            if name in clients:
-                send_line(conn, "ERROR|Name already taken")
-                conn.close()
-                return
-            clients[name] = {'conn': conn, 'addr': addr, 'pub': (int(n_str), int(e_str))}
-            registration_order.append(name)
-        print(f"[SERVER] Registered client '{name}' from {addr}.")
-        send_line(conn, "OK|Registered")
-        distribute_public_keys_if_ready()
-        while True:
-            line = recv_line(conn)
-            if not line:
-                print(f"[SERVER] Connection lost from {name}")
-                break
-            parts = line.split('|', 2)
-            typ = parts[0]
-            if typ == 'EXIT':
-                break
-            elif typ in ('KEY', 'MSG'):
-                with clients_lock:
-                    other_names = [k for k in clients.keys() if k != name]
-                    if not other_names:
-                        send_line(conn, "ERROR|No peer connected yet")
-                        continue
-                    other = other_names[0]
-                    other_conn = clients[other]['conn']
-                send_line(other_conn, f"{typ}|{name}|{parts[1]}")
-                print(f"[SERVER] Forwarded {typ} from {name} -> {other}")
-            else:
-                send_line(conn, "ERROR|Unknown message type")
-    except Exception as e:
-        print(f"[SERVER] Error in client handler: {e}")
-    finally:
-        with clients_lock:
-            to_remove = None
-            for k, v in list(clients.items()):
-                if v['conn'] == conn:
-                    to_remove = k
-            if to_remove:
-                del clients[to_remove]
-                try:
-                    registration_order.remove(to_remove)
-                except:
-                    pass
-                print(f"[SERVER] Client '{to_remove}' disconnected and removed")
-                for rem in clients.values():
-                    try:
-                        send_line(rem['conn'], f"INFO|Peer {to_remove} disconnected")
-                    except:
-                        pass
-        try:
-            conn.close()
-        except:
-            pass
+            conn.close();return
+        p=line.split('|')
+        if len(p)!=4 or p[0]!="REGISTER":
+            send(conn,"ERROR|Format salah")
+            conn.close();return
+        name=p[1]; n=p[2]; e=p[3]
+        if name in clients:
+            send(conn,"ERROR|Nama sudah dipakai");return
 
-def distribute_public_keys_if_ready():
-    with clients_lock:
-        if len(clients) < 2:
-            return
-        # pick two in registration order to keep determinism
-        a, b = registration_order[0], registration_order[1]
-        na, ea = clients[a]['pub']
-        nb, eb = clients[b]['pub']
-        # Send B's pubkey to A; mark A as INIT (initiator)
-        send_line(clients[a]['conn'], f"PUB|{b}|{nb}:{eb}|INIT")
-        # Send A's pubkey to B; B will not be initiator
-        send_line(clients[b]['conn'], f"PUB|{a}|{na}:{ea}")
-        print(f"[SERVER] Distributed public keys: {a} (initiator) <-> {b}")
+        clients[name]={"conn":conn,"pub":(int(n),int(e))}
+        order.append(name)
+        print(f"[SERVER] Registered {name}")
+        send(conn,"OK|Registered")
+
+        distribute()
+
+        while True:
+            line=recv_line(conn)
+            if not line:
+                break
+            s=line.split("|",2)
+            typ=s[0]
+            if typ=="EXIT": break
+            if typ in ("KEY","MSG"):
+                other=[k for k in clients.keys() if k!=name]
+                if not other:
+                    send(conn,"ERROR|No peer");continue
+                o=other[0]
+                send(clients[o]["conn"],f"{typ}|{name}|{s[1]}")
+    except: pass
+    finally:
+        if name in clients:
+            del clients[name]
+            order.remove(name)
+        try: conn.close()
+        except: pass
+
+def distribute():
+    if len(order)<2: return
+    a,b=order[0],order[1]
+    na,ea=clients[a]['pub']
+    nb,eb=clients[b]['pub']
+    send(clients[a]['conn'],f"PUB|{b}|{nb}:{eb}|INIT")
+    send(clients[b]['conn'],f"PUB|{a}|{na}:{ea}")
+    print(f"[SERVER] Distributed keys: {a}(INIT) <-> {b}")
 
 def main():
-    print("=== PK-Authority + Relay Chat Server (fixed) ===")
-    print(f"Listening on {HOST}:{PORT}")
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(5)
-    try:
-        while True:
-            conn, addr = srv.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
-    except KeyboardInterrupt:
-        print("\n[SERVER] Shutting down")
-    finally:
-        srv.close()
+    print("Server running...")
+    s=socket.socket()
+    s.setsockopt(1,2,1)
+    s.bind((HOST,PORT))
+    s.listen(5)
+    while True:
+        c,a=s.accept()
+        threading.Thread(target=handle,args=(c,a),daemon=True).start()
 
-if __name__ == '__main__':
+if __name__=="__main__":
     main()
