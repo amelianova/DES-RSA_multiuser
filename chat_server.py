@@ -1,18 +1,16 @@
-# chat_server.py
+# chat_server_fixed.py
 import socket
 import threading
 from typing import Dict
 
-HOST = '0.0.0.0'
+HOST = '192.168.100.163'
 PORT = 55555
 
-# Struktur penyimpanan client:
-# clients = {name: { 'conn': socket, 'addr': addr, 'pub': (n,e) }}
 clients: Dict[str, dict] = {}
 clients_lock = threading.Lock()
+registration_order = []  # keep order of registration
 
 def recv_line(conn):
-    # baca sampai newline
     data = b''
     while True:
         chunk = conn.recv(1024)
@@ -31,7 +29,6 @@ def send_line(conn, text):
 
 def handle_client(conn, addr):
     try:
-        # Step 1: client wajib kirim "REGISTER|<name>|<n>|<e>"
         line = recv_line(conn)
         if not line:
             conn.close()
@@ -48,18 +45,10 @@ def handle_client(conn, addr):
                 conn.close()
                 return
             clients[name] = {'conn': conn, 'addr': addr, 'pub': (int(n_str), int(e_str))}
-        print(f"[SERVER] Registered client '{name}' from {addr}. Public key n bits ~ {len(n_str)*4}")
-
+            registration_order.append(name)
+        print(f"[SERVER] Registered client '{name}' from {addr}.")
         send_line(conn, "OK|Registered")
-
-        # If two clients connected, distribute public keys
         distribute_public_keys_if_ready()
-
-        # Now listen for messages from this client and forward them accordingly.
-        # Messages format:
-        # - KEY|<cipher_hex>   (this is RSA-encrypted DES key)
-        # - MSG|<ciphertext_hex>  (this is DES-encrypted message)
-        # - EXIT|
         while True:
             line = recv_line(conn)
             if not line:
@@ -70,13 +59,11 @@ def handle_client(conn, addr):
             if typ == 'EXIT':
                 break
             elif typ in ('KEY', 'MSG'):
-                # forward to the other client
                 with clients_lock:
                     other_names = [k for k in clients.keys() if k != name]
                     if not other_names:
                         send_line(conn, "ERROR|No peer connected yet")
                         continue
-                    # in this assignment, we assume exactly 2 clients; forward to first other
                     other = other_names[0]
                     other_conn = clients[other]['conn']
                 send_line(other_conn, f"{typ}|{name}|{parts[1]}")
@@ -86,7 +73,6 @@ def handle_client(conn, addr):
     except Exception as e:
         print(f"[SERVER] Error in client handler: {e}")
     finally:
-        # cleanup
         with clients_lock:
             to_remove = None
             for k, v in list(clients.items()):
@@ -94,8 +80,11 @@ def handle_client(conn, addr):
                     to_remove = k
             if to_remove:
                 del clients[to_remove]
+                try:
+                    registration_order.remove(to_remove)
+                except:
+                    pass
                 print(f"[SERVER] Client '{to_remove}' disconnected and removed")
-                # notify remaining client
                 for rem in clients.values():
                     try:
                         send_line(rem['conn'], f"INFO|Peer {to_remove} disconnected")
@@ -110,18 +99,18 @@ def distribute_public_keys_if_ready():
     with clients_lock:
         if len(clients) < 2:
             return
-        names = list(clients.keys())
-        a, b = names[0], names[1]
+        # pick two in registration order to keep determinism
+        a, b = registration_order[0], registration_order[1]
         na, ea = clients[a]['pub']
         nb, eb = clients[b]['pub']
-        # Send B's pubkey to A
-        send_line(clients[a]['conn'], f"PUB|{b}|{nb}:{eb}")
-        # Send A's pubkey to B
+        # Send B's pubkey to A; mark A as INIT (initiator)
+        send_line(clients[a]['conn'], f"PUB|{b}|{nb}:{eb}|INIT")
+        # Send A's pubkey to B; B will not be initiator
         send_line(clients[b]['conn'], f"PUB|{a}|{na}:{ea}")
-        print(f"[SERVER] Distributed public keys: {a} <-> {b}")
+        print(f"[SERVER] Distributed public keys: {a} (initiator) <-> {b}")
 
 def main():
-    print("=== PK-Authority + Relay Chat Server ===")
+    print("=== PK-Authority + Relay Chat Server (fixed) ===")
     print(f"Listening on {HOST}:{PORT}")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
